@@ -4,10 +4,11 @@ import firebase_admin
 from firebase_admin import credentials, firestore
 from datetime import datetime, time, timedelta
 import asyncio
+from types import SimpleNamespace
 
 
 # Initialize Firebase Admin SDK
-cred = credentials.Certificate("<CREDENTIALS>")
+<FIREBASE CREDENTIALS>
 firebase_admin.initialize_app(cred)
 db = firestore.client()
 
@@ -20,9 +21,6 @@ intents.message_content = True
 
 bot = commands.Bot(command_prefix='!', intents=intents)
 
-
-#set cooldowns of 1 hour for static table generation
-
 cooldown_mapping_games = commands.CooldownMapping.from_cooldown(1, 3600, commands.BucketType.user)
 
 cooldown_mapping_dlc = commands.CooldownMapping.from_cooldown(1, 3600, commands.BucketType.user)
@@ -32,6 +30,23 @@ cooldown_mapping_dlc = commands.CooldownMapping.from_cooldown(1, 3600, commands.
 async def on_ready():
     print(f'Logged in as {bot.user.name}')
     await bot.change_presence(activity=discord.Game(name='!helpme'))
+
+    # Check Firestore for any running 'watchgames' commands
+    docs = db.collection('watchgames').get()
+
+    for doc in docs:
+        guild_id = doc.id
+        guild = bot.get_guild(int(guild_id))
+        if guild:  # If the guild is found
+            # Create a context-like object to pass to update_games_table
+            ctx = SimpleNamespace()
+            ctx.guild = guild
+            ctx.channel = guild.get_channel(int(list(doc.get('channels').keys())[0]))  # Gets the first channel stored
+
+            # Set is_watchgames_running to True and start the update_games_table task
+            global is_watchgames_running
+            is_watchgames_running = True
+            bot.loop.create_task(update_games_table(ctx))  # Start the task in the event loop
 
 
 @bot.command()
@@ -50,9 +65,8 @@ async def helpme(ctx):
                                        ' (Cooldown of 60 minutes per user)', inline=False)
     embed.add_field(name='!watchgames', value='Generates a single games table that will update itself every day with '
                                               'any new or outdated sales. Should only be used in a dedicated channel  '
-                                              'to keep information visible. Can only be activate'
-                                              ' in one channel for a server. (Will need to be run again after a bot '
-                                              'update)', inline=False)
+                                              'to keep information visible. Can only be active for a single instance'
+                                              ' in a server', inline=False)
     embed.add_field(name='!stopwatchgames', value='used to stop an active instance of !watchgames', inline=False)
 
     # Set the footer
@@ -60,7 +74,6 @@ async def helpme(ctx):
 
     await ctx.send(embed=embed)
 
-#Static games table
 
 @bot.command()
 async def games(ctx):
@@ -150,13 +163,27 @@ async def dlc(ctx):
 
 is_watchgames_running = False  # Shared variable to track command status
 
+
 @bot.command()
 async def watchgames(ctx):
     global is_watchgames_running
 
-    if is_watchgames_running:
-        await ctx.send("The `watchgames` command is already running.")
+    # Check if the watchgames command is already running in the guild
+    doc_ref = db.collection('watchgames').document(str(ctx.guild.id))
+    doc = doc_ref.get()
+    if doc.exists:
+        await ctx.send("The `watchgames` command is already running in this guild.")
         return
+
+    # Set the watchgames command as running in the guild and store the channel and message IDs
+    message = await ctx.send("Watchgames command is running...")
+    doc_ref.set({
+        'channels': {
+            str(ctx.channel.id): {
+                'message_id': message.id
+            }
+        }
+    })
 
     is_watchgames_running = True
 
@@ -165,13 +192,10 @@ async def watchgames(ctx):
         embed = await generate_games_table()
 
         # Post the table in the channel
-        message = await ctx.send(embed=embed)
-
-        # Get the channel ID from the message's channel
-        channel_id = message.channel.id
+        await message.edit(embed=embed)
 
         # Start updating the game table
-        await update_games_table(ctx, channel_id)
+        await update_games_table(ctx)
     finally:
         is_watchgames_running = False
 
@@ -211,26 +235,49 @@ async def generate_games_table():
     return embed
 
 
-async def update_games_table(ctx, channel_id):
-    target_time = time(hour=17, minute=2)  # Set to a minute after DB update, which is a minute after steam sales update
+async def update_games_table(ctx):
+    target_time = time(hour=17, minute=48)  # Replace with your desired UTC time (e.g., 17:02)
+
+    # Retrieve channel and message IDs from the Firestore database
+    doc_ref = db.collection('watchgames').document(str(ctx.guild.id))
+    doc = doc_ref.get()
+    if not doc.exists:
+        return
+
+    channels = doc.get('channels')
 
     while is_watchgames_running:
         now = datetime.utcnow().time()
         if now.hour == target_time.hour and now.minute == target_time.minute:
-            # Fetch the updated game table from Firestore
-            embed = await generate_games_table()
+            for channel_id, channel_data in channels.items():
+                # Fetch the updated game table from Firestore
+                embed = await generate_games_table()
 
-            # Get the channel object using the channel ID
-            channel = bot.get_channel(channel_id)
+                # Get the channel object using the channel ID
+                channel = bot.get_channel(int(channel_id))
 
-            # Delete the existing message
-            async for message in channel.history(limit=1):
-                if message.author == bot.user:
-                    await message.delete()
-                    break
+                if channel:
+                    message_id = channel_data.get('message_id')
 
-            # Send a new message with the updated table
-            await channel.send(embed=embed)
+                    if message_id:
+                        try:
+                            # Fetch the message using the message ID
+                            message = await channel.fetch_message(int(message_id))
+
+                            # Delete the existing message
+                            await message.delete()
+                        except discord.NotFound:
+                            pass
+
+                    # Send a new message with the updated table
+                    new_message = await channel.send(embed=embed)
+
+                    # Update the message ID in the database
+                    channels[channel_id]['message_id'] = str(new_message.id)
+
+            doc_ref.update({
+                'channels': channels
+            })
 
             # Calculate the time until the next target time
             current_datetime = datetime.utcnow()
@@ -242,7 +289,7 @@ async def update_games_table(ctx, channel_id):
             # Sleep until the next target time
             await asyncio.sleep(sleep_time)
         else:
-            # If/else to prevent bot from skipping the current day if invoked before 17:02 UTC
+            # Calculate the time until the next target time
             current_datetime = datetime.utcnow()
             next_target_datetime = datetime.combine(current_datetime.date(), target_time)
             if current_datetime > next_target_datetime:
@@ -252,16 +299,20 @@ async def update_games_table(ctx, channel_id):
             # Sleep until the next target time
             await asyncio.sleep(sleep_time)
 
-# Helper Function to allow disabling !watchgames to prevent redundant updates in the same discord
 @bot.command()
 async def stopwatchgames(ctx):
     global is_watchgames_running
 
-    if is_watchgames_running:
-        is_watchgames_running = False
-        await ctx.send("The `watchgames` command has been stopped.")
-    else:
-        await ctx.send("The `watchgames` command is not currently running.")
+    # Check if the watchgames command is running in the guild
+    doc_ref = db.collection('watchgames').document(str(ctx.guild.id))
+    doc = doc_ref.get()
+    if not doc.exists:
+        await ctx.send("The `watchgames` command is not currently running in this guild.")
+        return
 
-
-bot.run('<BOT KEY>')
+    # Stop the watchgames command and remove the document from Firestore
+    doc_ref.delete()
+    is_watchgames_running = False
+    await ctx.send("The `watchgames` command has been stopped.")
+    
+    <BOT CREDENTIALS>
